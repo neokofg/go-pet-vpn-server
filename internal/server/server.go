@@ -18,9 +18,35 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
+
+const (
+	MaxConcurrentClients = 100
+	ReadTimeout          = 30 * time.Second
+	WriteTimeout         = 10 * time.Second
+	MaxPacketSize        = 1500
+)
+
+type ServerStats struct {
+	ActiveClients   int64
+	PacketsReceived int64
+	PacketsSent     int64
+	BytesReceived   int64
+	BytesSent       int64
+	sync.RWMutex
+}
+
+func CheckRootPrivileges() error {
+	if runtime.GOOS != "windows" {
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("this program must be run as root (sudo)")
+		}
+	}
+	return nil
+}
 
 type Client struct {
 	ID          uint
@@ -64,12 +90,53 @@ type Server struct {
 	db           *gorm.DB
 	tcpListener  net.Listener
 	udpConn      *net.UDPConn
-	clients      map[string]*Client // ключ - токен
+	clients      map[string]*Client
 	clientsMutex sync.RWMutex
 	ctx          context.Context
 	cancel       context.CancelFunc
 	tunInterface *TUNDevice
 	ipPool       *IPPool
+	stats        *ServerStats
+}
+
+func (s *Server) GracefulShutdown(timeout time.Duration) error {
+	// Создаем контекст с таймаутом для shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Отправляем всем клиентам сигнал отключения
+	s.clientsMutex.Lock()
+	for _, client := range s.clients {
+		if client.UDPAddr != nil {
+			header := &protocol.PacketHeader{
+				Version: protocol.ProtocolVersion,
+				Type:    protocol.PacketTypeDisconnect,
+			}
+			packet := header.Marshal()
+			s.udpConn.WriteToUDP(packet, client.UDPAddr)
+		}
+	}
+	s.clientsMutex.Unlock()
+
+	// Ждем завершения всех горутин или таймаута
+	done := make(chan struct{})
+	go func() {
+		s.clientsMutex.Lock()
+		for len(s.clients) > 0 {
+			s.clientsMutex.Unlock()
+			time.Sleep(100 * time.Millisecond)
+			s.clientsMutex.Lock()
+		}
+		s.clientsMutex.Unlock()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
 }
 
 func NewServer(cfg *config.Config, db *gorm.DB) (*Server, error) {
@@ -111,6 +178,25 @@ func NewServer(cfg *config.Config, db *gorm.DB) (*Server, error) {
 }
 
 func (s *Server) Start(tunCfg *TunnelConfig) error {
+	// Проверяем root права
+	if err := CheckRootPrivileges(); err != nil {
+		return fmt.Errorf("insufficient privileges: %v", err)
+	}
+
+	if err := s.checkNetworkConfig(); err != nil {
+		return fmt.Errorf("network configuration check failed: %v", err)
+	}
+
+	log.Printf("Starting VPN server with config: %+v", tunCfg)
+
+	// Очищаем старую конфигурацию
+	if err := cleanupOldConfig(tunCfg.Interface, tunCfg.CIDR); err != nil {
+		log.Printf("Warning during cleanup: %v", err)
+	}
+
+	// Даем системе время на очистку ресурсов
+	time.Sleep(time.Second)
+
 	// Инициализируем IP пул
 	ipPool, err := NewIPPool(tunCfg.CIDR)
 	if err != nil {
@@ -118,12 +204,19 @@ func (s *Server) Start(tunCfg *TunnelConfig) error {
 	}
 	s.ipPool = ipPool
 
-	// Создаем и настраиваем TUN интерфейс
-	tunInterface, err := s.setupTunnel(tunCfg)
+	// Настраиваем TUN интерфейс
+	tunDevice, err := s.setupTunnel(tunCfg)
 	if err != nil {
 		return fmt.Errorf("failed to setup TUN interface: %v", err)
 	}
-	s.tunInterface = tunInterface
+	s.tunInterface = tunDevice
+
+	if s.tunInterface == nil {
+		return fmt.Errorf("TUN interface was not properly initialized")
+	}
+
+	// Даем системе время на применение настроек
+	time.Sleep(time.Second)
 
 	// Настраиваем маршрутизацию
 	if err := s.setupRouting(tunCfg); err != nil {
@@ -131,26 +224,115 @@ func (s *Server) Start(tunCfg *TunnelConfig) error {
 		return fmt.Errorf("failed to setup routing: %v", err)
 	}
 
-	// Запускаем обработку TCP подключений
-	go s.handleTCPConnections()
+	errChan := make(chan error, 4)
 
-	// Запускаем обработку UDP пакетов
-	go s.handleUDPPackets()
+	// Запускаем все обработчики
+	go func() {
+		if err := s.handleTCPConnections(); err != nil {
+			errChan <- fmt.Errorf("TCP handler error: %v", err)
+		}
+	}()
 
-	// Запускаем обработку TUN интерфейса
-	go s.handleTunToUDP(tunInterface)
+	go func() {
+		if err := s.handleUDPPackets(); err != nil {
+			errChan <- fmt.Errorf("UDP handler error: %v", err)
+		}
+	}()
 
-	// Запускаем очистку неактивных клиентов
+	if s.tunInterface == nil {
+		return fmt.Errorf("TUN interface is nil before starting handlers")
+	}
+
+	go func() {
+		if err := s.handleTunToUDP(); err != nil {
+			errChan <- fmt.Errorf("TUN-to-UDP handler error: %v", err)
+		}
+	}()
+
 	go s.cleanupInactiveClients()
 
-	log.Printf("Server started. TCP: %s, UDP: %s, TUN: %s",
-		s.cfg.TCPAddr, s.cfg.UDPAddr, tunInterface.Name)
+	log.Printf("Server started successfully. TCP: %s, UDP: %s, TUN: %s, Network: %s",
+		s.cfg.TCPAddr, s.cfg.UDPAddr, tunCfg.Interface, tunCfg.CIDR)
 
-	<-s.ctx.Done()
+	// Проверяем состояние системы
+	go s.monitorSystemState(tunCfg)
 
-	// Очищаем настройки при остановке
-	s.cleanupRouting(tunCfg)
+	select {
+	case err := <-errChan:
+		return err
+	case <-s.ctx.Done():
+		return nil
+	}
+}
+
+func (s *Server) checkNetworkConfig() error {
+	// Проверяем наличие необходимых утилит
+	requiredCommands := []string{"ip", "iptables", "sysctl"}
+	for _, cmd := range requiredCommands {
+		if _, err := exec.LookPath(cmd); err != nil {
+			return fmt.Errorf("required command not found: %s", cmd)
+		}
+	}
+
+	// Проверяем поддержку TUN
+	if _, err := os.Stat("/dev/net/tun"); os.IsNotExist(err) {
+		return fmt.Errorf("TUN/TAP device not found: /dev/net/tun")
+	}
+
+	// Проверяем права на выполнение команд
+	cmd := exec.Command("ip", "link", "list")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("insufficient permissions to run ip command: %v", err)
+	}
+
+	cmd = exec.Command("iptables", "-L")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("insufficient permissions to run iptables: %v", err)
+	}
+
+	// Проверяем статус systemd-networkd
+	cmd = exec.Command("systemctl", "status", "systemd-networkd")
+	output, err := cmd.CombinedOutput()
+	if err == nil && strings.Contains(string(output), "Active: active") {
+		log.Printf("Warning: systemd-networkd is running and might interfere with VPN")
+	}
+
 	return nil
+}
+
+func (s *Server) monitorSystemState(cfg *TunnelConfig) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			// Проверяем состояние интерфейса
+			if iface, err := net.InterfaceByName(cfg.Interface); err != nil {
+				log.Printf("Warning: interface check failed: %v", err)
+			} else {
+				log.Printf("Interface %s state: %v", cfg.Interface, iface.Flags)
+			}
+
+			// Проверяем маршруты
+			cmd := exec.Command("ip", "route", "show", "dev", cfg.Interface)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				log.Printf("Warning: route check failed: %v", err)
+			} else {
+				log.Printf("Routes for %s:\n%s", cfg.Interface, string(output))
+			}
+
+			// Проверяем правила iptables
+			cmd = exec.Command("iptables", "-L", "FORWARD", "-v", "-n")
+			if output, err := cmd.CombinedOutput(); err != nil {
+				log.Printf("Warning: iptables check failed: %v", err)
+			} else {
+				log.Printf("Forward rules:\n%s", string(output))
+			}
+		}
+	}
 }
 
 func (s *Server) Stop() {
@@ -183,12 +365,12 @@ func (s *Server) ReleaseIP(client *Client) {
 	}
 }
 
-func (s *Server) handleTCPConnections() {
+func (s *Server) handleTCPConnections() error {
 	for {
 		conn, err := s.tcpListener.Accept()
 		if err != nil {
 			if s.ctx.Err() != nil {
-				return // Сервер остановлен
+				return err // Сервер остановлен
 			}
 			log.Printf("Error accepting TCP connection: %v", err)
 			continue
@@ -199,16 +381,34 @@ func (s *Server) handleTCPConnections() {
 }
 
 func (s *Server) handleTCPClient(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing TCP connection: %v", err)
+		}
+	}()
+
+	// Проверяем количество активных клиентов
+	s.clientsMutex.RLock()
+	if len(s.clients) >= MaxConcurrentClients {
+		s.clientsMutex.RUnlock()
+		log.Printf("Max clients limit reached, rejecting connection")
+		return
+	}
+	s.clientsMutex.RUnlock()
 
 	// Устанавливаем таймаут для хендшейка
 	conn.SetDeadline(time.Now().Add(protocol.HandshakeTimeout * time.Second))
 
-	// Читаем handshake пакет
-	buf := make([]byte, protocol.HeaderSize+120) // Размер заголовка + размер handshake пакета
+	// Ограничиваем размер буфера
+	buf := make([]byte, protocol.HeaderSize+120)
 	n, err := conn.Read(buf)
 	if err != nil {
 		log.Printf("Error reading handshake: %v", err)
+		return
+	}
+
+	if n > len(buf) {
+		log.Printf("Handshake packet too large")
 		return
 	}
 
@@ -305,17 +505,31 @@ func (s *Server) handleTCPClient(conn net.Conn) {
 	log.Printf("Client connected: %s", token.Token)
 }
 
-func (s *Server) handleUDPPackets() {
+func (s *Server) handleUDPPackets() error {
 	buf := make([]byte, protocol.MaxPacketSize)
 	for {
+		s.udpConn.SetReadDeadline(time.Now().Add(ReadTimeout))
 		n, addr, err := s.udpConn.ReadFromUDP(buf)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
 			if s.ctx.Err() != nil {
-				return // Сервер остановлен
+				return err
 			}
 			log.Printf("Error reading UDP packet: %v", err)
 			continue
 		}
+
+		if n > MaxPacketSize {
+			log.Printf("Packet too large from %s: %d bytes", addr.String(), n)
+			continue
+		}
+
+		s.stats.Lock()
+		s.stats.PacketsReceived++
+		s.stats.BytesReceived += int64(n)
+		s.stats.Unlock()
 
 		go s.handleUDPPacket(buf[:n], addr)
 	}
@@ -431,14 +645,16 @@ type Route struct {
 }
 
 func NewTUN(config *TUNConfig) (*TUNDevice, error) {
-	// Создаем TUN интерфейс
+	log.Printf("Creating TUN interface %s...", config.Name)
+
+	// Создаем конфигурацию для water
 	cfg := water.Config{
 		DeviceType: water.TUN,
-	}
-
-	// В Linux можно задать имя интерфейса
-	if runtime.GOOS == "linux" {
-		cfg.Name = config.Name
+		PlatformSpecificParams: water.PlatformSpecificParams{
+			Name:       config.Name,
+			Persist:    true, // Делаем интерфейс постоянным
+			MultiQueue: true, // Поднимаем интерфейс сразу
+		},
 	}
 
 	ifce, err := water.New(cfg)
@@ -452,12 +668,23 @@ func NewTUN(config *TUNConfig) (*TUNDevice, error) {
 		config:    config,
 	}
 
-	// Настраиваем интерфейс
+	// Ждем немного перед настройкой
+	time.Sleep(time.Second)
+
+	log.Printf("Configuring TUN interface %s...", tun.name)
 	if err := tun.configure(); err != nil {
 		tun.Close()
 		return nil, err
 	}
 
+	// Проверяем состояние интерфейса после настройки
+	iface, err := net.InterfaceByName(tun.name)
+	if err != nil {
+		tun.Close()
+		return nil, fmt.Errorf("failed to get interface state: %v", err)
+	}
+
+	log.Printf("Interface %s flags: %v", tun.name, iface.Flags)
 	return tun, nil
 }
 
@@ -473,34 +700,43 @@ func (t *TUNDevice) configure() error {
 }
 
 func (t *TUNDevice) configureLinux() error {
-	// Поднимаем интерфейс
-	if err := exec.Command("ip", "link", "set", "dev", t.name, "up").Run(); err != nil {
-		return fmt.Errorf("failed to up interface: %v", err)
+	// Ждем немного перед настройкой
+	time.Sleep(time.Second)
+
+	// Отключаем IPv6
+	if err := exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6=1", t.name)).Run(); err != nil {
+		log.Printf("Warning: failed to disable IPv6: %v", err)
 	}
 
-	// Устанавливаем MTU
-	if err := exec.Command("ip", "link", "set", "dev", t.name, "mtu", fmt.Sprintf("%d", t.config.MTU)).Run(); err != nil {
-		return fmt.Errorf("failed to set MTU: %v", err)
+	// Поднимаем интерфейс и устанавливаем MTU
+	cmd := exec.Command("ip", "link", "set", "dev", t.name, "up", "mtu", fmt.Sprintf("%d", t.config.MTU))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to set interface up: %v, output: %s", err, output)
 	}
+
+	// Ждем после поднятия интерфейса
+	time.Sleep(time.Second)
+
+	// Проверяем состояние
+	iface, err := net.InterfaceByName(t.name)
+	if err != nil {
+		return fmt.Errorf("failed to get interface after up: %v", err)
+	}
+	log.Printf("Interface %s state after up: %v", t.name, iface.Flags)
 
 	// Назначаем IP адрес
 	addr := fmt.Sprintf("%s/%d", t.config.Address.String(), maskBits(t.config.Network.Mask))
-	if err := exec.Command("ip", "addr", "add", addr, "dev", t.name).Run(); err != nil {
-		return fmt.Errorf("failed to set address: %v", err)
-	}
-
-	// Добавляем маршруты
-	for _, route := range t.config.Routes {
-		args := []string{"route", "add", route.Network.String()}
-		if route.Gateway != nil {
-			args = append(args, "via", route.Gateway.String())
-		}
-		args = append(args, "dev", t.name)
-
-		if err := exec.Command("ip", args...).Run(); err != nil {
-			return fmt.Errorf("failed to add route: %v", err)
+	cmd = exec.Command("ip", "addr", "add", addr, "dev", t.name)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		// Если адрес уже существует, пробуем его заменить
+		cmd = exec.Command("ip", "addr", "replace", addr, "dev", t.name)
+		if output, err = cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to set address: %v, output: %s", err, output)
 		}
 	}
+
+	// Ждем после настройки адреса
+	time.Sleep(time.Second)
 
 	return nil
 }
@@ -568,10 +804,6 @@ func (t *TUNDevice) Close() error {
 	return t.Interface.Close()
 }
 
-const (
-	TUN_MTU = 1500
-)
-
 type TunnelConfig struct {
 	Interface string // Имя TUN интерфейса
 	CIDR      string // CIDR для туннеля (например, "10.0.0.0/24")
@@ -610,34 +842,30 @@ func (s *Server) setupTunnel(cfg *TunnelConfig) (*TUNDevice, error) {
 		return nil, fmt.Errorf("failed to create TUN interface: %v", err)
 	}
 
-	// Создаем IP пул для клиентов (исключая адрес сервера)
-	s.ipPool, err = NewIPPool(cfg.CIDR)
-	if err != nil {
-		tun.Close()
-		return nil, fmt.Errorf("failed to create IP pool: %v", err)
-	}
-	// Резервируем первый адрес для сервера
-	s.ipPool.Reserve(serverIP)
-
-	// Настраиваем маршрутизацию
-	if err := s.setupRouting(cfg); err != nil {
-		tun.Close()
-		return nil, fmt.Errorf("failed to setup routing: %v", err)
-	}
-
-	log.Printf("TUN interface %s configured with IP %s", tun.name, serverIP)
 	return tun, nil
 }
 
-func (s *Server) handleTunToUDP(tun *TUNDevice) {
-	defer tun.Close()
+func (s *Server) handleTunToUDP() error {
+	if s.tunInterface == nil {
+		return fmt.Errorf("TUN interface is nil")
+	}
+
+	defer func() {
+		if s.tunInterface != nil {
+			s.tunInterface.Close()
+		}
+	}()
 
 	for {
+		if s.ctx.Err() != nil {
+			return nil // Сервер остановлен
+		}
+
 		// Читаем пакет из TUN
-		packet, err := tun.ReadPacket()
+		packet, err := s.tunInterface.ReadPacket()
 		if err != nil {
 			if s.ctx.Err() != nil {
-				return // Сервер остановлен
+				return nil // Сервер остановлен
 			}
 			log.Printf("Error reading from TUN: %v", err)
 			continue
@@ -655,7 +883,7 @@ func (s *Server) handleTunToUDP(tun *TUNDevice) {
 		s.clientsMutex.RLock()
 		var targetClient *Client
 		for _, client := range s.clients {
-			if client.AssignedIP.Equal(dstIP) {
+			if client.AssignedIP != nil && client.AssignedIP.Equal(dstIP) {
 				targetClient = client
 				break
 			}
@@ -666,39 +894,46 @@ func (s *Server) handleTunToUDP(tun *TUNDevice) {
 			continue // Неизвестный получатель
 		}
 
-		targetClient.Lock()
-
-		// Создаем nonce для шифрования
-		nonce := make([]byte, chacha20poly1305.NonceSize)
-		copy(nonce, targetClient.ServerNonce[:])
-		binary.BigEndian.PutUint64(nonce[len(nonce)-8:], targetClient.SequenceNum)
-
-		// Шифруем пакет
-		encrypted := targetClient.AEAD.Seal(nil, nonce, packet, nil)
-
-		// Создаем заголовок
-		header := &protocol.PacketHeader{
-			Version:     protocol.ProtocolVersion,
-			Type:        protocol.PacketTypeData,
-			SequenceNum: targetClient.SequenceNum,
-			PayloadSize: uint32(len(encrypted)),
-		}
-
-		// Увеличиваем sequence number
-		targetClient.SequenceNum++
-
-		// Формируем полный пакет
-		fullPacket := append(header.Marshal(), encrypted...)
-
-		targetClient.Unlock()
-
 		// Отправляем пакет клиенту
-		if targetClient.UDPAddr != nil {
-			if _, err := s.udpConn.WriteToUDP(fullPacket, targetClient.UDPAddr); err != nil {
-				log.Printf("Error sending packet to client %s: %v", targetClient.AssignedIP, err)
-			}
+		if err := s.sendPacketToClient(targetClient, packet); err != nil {
+			log.Printf("Error sending packet to client %s: %v", targetClient.AssignedIP, err)
 		}
 	}
+}
+
+func (s *Server) sendPacketToClient(client *Client, packet []byte) error {
+	client.Lock()
+	defer client.Unlock()
+
+	if client.UDPAddr == nil || client.AEAD == nil {
+		return fmt.Errorf("client not ready for UDP communication")
+	}
+
+	// Создаем nonce для шифрования
+	nonce := make([]byte, chacha20poly1305.NonceSize)
+	copy(nonce, client.ServerNonce[:])
+	binary.BigEndian.PutUint64(nonce[len(nonce)-8:], client.SequenceNum)
+
+	// Шифруем пакет
+	encrypted := client.AEAD.Seal(nil, nonce, packet, nil)
+
+	// Создаем заголовок
+	header := &protocol.PacketHeader{
+		Version:     protocol.ProtocolVersion,
+		Type:        protocol.PacketTypeData,
+		SequenceNum: client.SequenceNum,
+		PayloadSize: uint32(len(encrypted)),
+	}
+
+	// Увеличиваем sequence number
+	client.SequenceNum++
+
+	// Формируем полный пакет
+	fullPacket := append(header.Marshal(), encrypted...)
+
+	// Отправляем пакет
+	_, err := s.udpConn.WriteToUDP(fullPacket, client.UDPAddr)
+	return err
 }
 
 func (s *Server) handleEncryptedPacket(client *Client, header *protocol.PacketHeader, encryptedData []byte) error {
@@ -788,26 +1023,137 @@ func (s *Server) setupRouting(cfg *TunnelConfig) error {
 }
 
 func (s *Server) setupLinuxRouting(cfg *TunnelConfig) error {
+	log.Printf("Setting up routing for %s...", cfg.Interface)
+
+	// Получаем имя основного сетевого интерфейса
+	defaultIface, err := getDefaultInterface()
+	if err != nil {
+		log.Printf("Warning: failed to get default interface automatically: %v", err)
+		// Пытаемся получить имя интерфейса из окружения
+		defaultIface = os.Getenv("VPN_DEFAULT_IFACE")
+		if defaultIface == "" {
+			// Проверяем наличие конкретных интерфейсов
+			for _, iface := range []string{"eth0", "en0", "ens33", "enp0s3"} {
+				if _, err := net.InterfaceByName(iface); err == nil {
+					defaultIface = iface
+					break
+				}
+			}
+			if defaultIface == "" {
+				return fmt.Errorf("no network interface found and VPN_DEFAULT_IFACE not set")
+			}
+		}
+	}
+
+	log.Printf("Using network interface: %s", defaultIface)
+
 	// Включаем IP forwarding
 	if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
-		return fmt.Errorf("failed to enable IP forwarding: %v", err)
+		log.Printf("Warning: failed to enable IP forwarding: %v", err)
 	}
 
 	// Настраиваем NAT
-	if err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", cfg.CIDR, "-j", "MASQUERADE").Run(); err != nil {
-		return fmt.Errorf("failed to setup NAT: %v", err)
+	natRule := []string{"-t", "nat", "-A", "POSTROUTING", "-s", cfg.CIDR, "-o", defaultIface, "-j", "MASQUERADE"}
+	cmd := exec.Command("iptables", natRule...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: failed to setup NAT, trying alternative method: %v, output: %s", err, output)
+		// Пробуем альтернативный метод NAT
+		natRule = []string{"-t", "nat", "-A", "POSTROUTING", "-s", cfg.CIDR, "-j", "MASQUERADE"}
+		cmd = exec.Command("iptables", natRule...)
+		if output, err = cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to setup NAT: %v, output: %s", err, output)
+		}
 	}
 
-	// Разрешаем форвардинг для VPN трафика
-	if err := exec.Command("iptables", "-A", "FORWARD", "-i", cfg.Interface, "-j", "ACCEPT").Run(); err != nil {
-		return fmt.Errorf("failed to allow forwarding: %v", err)
+	// Разрешаем форвардинг
+	forwardRules := [][]string{
+		{"-A", "FORWARD", "-i", cfg.Interface, "-j", "ACCEPT"},
+		{"-A", "FORWARD", "-o", cfg.Interface, "-j", "ACCEPT"},
 	}
 
-	if err := exec.Command("iptables", "-A", "FORWARD", "-o", cfg.Interface, "-j", "ACCEPT").Run(); err != nil {
-		return fmt.Errorf("failed to allow forwarding: %v", err)
+	for _, rule := range forwardRules {
+		cmd = exec.Command("iptables", rule...)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: failed to add forward rule: %v, output: %s", err, output)
+			// Продолжаем выполнение, так как некоторые правила могут уже существовать
+		}
+	}
+
+	// Добавляем маршрут
+	cmd = exec.Command("ip", "route", "add", cfg.CIDR, "dev", cfg.Interface)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: failed to add route, trying replacement: %v, output: %s", err, output)
+		// Пробуем заменить существующий маршрут
+		cmd = exec.Command("ip", "route", "replace", cfg.CIDR, "dev", cfg.Interface)
+		if output, err = cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to setup route: %v, output: %s", err, output)
+		}
 	}
 
 	return nil
+}
+
+func getDefaultInterface() (string, error) {
+	// Пробуем несколько способов найти интерфейс по умолчанию
+
+	// Способ 1: через ip route
+	cmd := exec.Command("ip", "route", "show", "default")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		fields := strings.Fields(string(output))
+		for i, field := range fields {
+			if field == "dev" && i+1 < len(fields) {
+				return fields[i+1], nil
+			}
+		}
+	}
+
+	// Способ 2: проверяем популярные интерфейсы
+	commonInterfaces := []string{"eth0", "en0", "ens33", "enp0s3", "wlan0", "wlp2s0"}
+	for _, ifname := range commonInterfaces {
+		iface, err := net.InterfaceByName(ifname)
+		if err != nil {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		// Проверяем, есть ли у интерфейса IP адрес
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+				return ifname, nil
+			}
+		}
+	}
+
+	// Способ 3: перебираем все интерфейсы
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("failed to list interfaces: %v", err)
+	}
+
+	for _, iface := range interfaces {
+		// Пропускаем loopback и интерфейсы без флага up
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+				return iface.Name, nil
+			}
+		}
+	}
+
+	return "", errors.New("no suitable network interface found")
 }
 
 func (s *Server) setupDarwinRouting(cfg *TunnelConfig) error {
@@ -872,4 +1218,81 @@ func (s *Server) cleanupDarwinRouting(cfg *TunnelConfig) error {
 	exec.Command("pfctl", "-d").Run()
 
 	return nil
+}
+
+// cleanupOldConfig очищает старые настройки VPN
+func cleanupOldConfig(interfaceName string, cidr string) error {
+	log.Printf("Cleaning up old VPN configuration...")
+
+	// Останавливаем systemd-networkd
+	if err := exec.Command("systemctl", "stop", "systemd-networkd").Run(); err != nil {
+		log.Printf("Warning: failed to stop systemd-networkd: %v", err)
+	}
+
+	// Удаляем старый интерфейс
+	cleanupInterface(interfaceName)
+
+	// Ждем немного после удаления интерфейса
+	time.Sleep(time.Second * 2)
+
+	// Очищаем правила iptables
+	cleanupIPTables(interfaceName, cidr)
+
+	// Очищаем маршруты
+	cleanupRoutes(interfaceName, cidr)
+
+	return nil
+}
+
+// cleanupIPTables очищает правила iptables
+func cleanupIPTables(interfaceName string, cidr string) {
+	// Получаем основной интерфейс
+	defaultIface, err := getDefaultInterface()
+	if err != nil {
+		log.Printf("Warning: couldn't get default interface: %v", err)
+		defaultIface = "*" // Используем wildcard если не можем получить интерфейс
+	}
+
+	rules := [][]string{
+		{"iptables", "-t", "nat", "-D", "POSTROUTING", "-s", cidr, "-o", defaultIface, "-j", "MASQUERADE"},
+		{"iptables", "-D", "FORWARD", "-i", interfaceName, "-j", "ACCEPT"},
+		{"iptables", "-D", "FORWARD", "-o", interfaceName, "-j", "ACCEPT"},
+	}
+
+	for _, rule := range rules {
+		// Пытаемся удалить правило несколько раз, так как их может быть несколько
+		for i := 0; i < 5; i++ {
+			cmd := exec.Command(rule[0], rule[1:]...)
+			if _, err := cmd.CombinedOutput(); err != nil {
+				break // Правило больше не существует
+			}
+			log.Printf("Removed iptables rule: %v", rule)
+		}
+	}
+}
+
+// cleanupRoutes очищает маршруты
+func cleanupRoutes(interfaceName string, cidr string) {
+	// Удаляем все маршруты для интерфейса
+	cmd := exec.Command("ip", "route", "flush", "dev", interfaceName)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: couldn't flush routes: %v, output: %s", err, string(output))
+	}
+
+	// Дополнительно пытаемся удалить конкретный маршрут
+	cmd = exec.Command("ip", "route", "del", cidr, "dev", interfaceName)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: couldn't delete specific route: %v, output: %s", err, string(output))
+	}
+}
+
+// cleanupInterface удаляет старый интерфейс
+func cleanupInterface(interfaceName string) {
+	cmd := exec.Command("ip", "link", "delete", interfaceName)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: couldn't delete interface %s: %v, output: %s",
+			interfaceName, err, output)
+	} else {
+		log.Printf("Removed interface: %s", interfaceName)
+	}
 }

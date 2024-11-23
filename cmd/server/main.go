@@ -10,10 +10,14 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 )
 
 func main() {
+	if err := server.CheckRootPrivileges(); err != nil {
+		log.Fatalf("Error: %v\nPlease run this program with sudo", err)
+	}
 	// Парсим аргументы командной строки
 	tcpAddr := flag.String("tcp", ":8000", "TCP address to listen on")
 	udpAddr := flag.String("udp", ":8001", "UDP address to listen on")
@@ -21,6 +25,15 @@ func main() {
 	tunName := flag.String("tun", "tun0", "TUN interface name")
 	vpnCIDR := flag.String("cidr", "10.0.0.0/24", "VPN network CIDR")
 	flag.Parse()
+
+	if runtime.GOOS == "linux" {
+		if _, err := os.Stat("/dev/net/tun"); os.IsNotExist(err) {
+			log.Fatal("Error: TUN/TAP driver not available. Please install it:\n" +
+				"For Ubuntu/Debian: sudo apt-get install linux-modules-extra-$(uname -r)\n" +
+				"For CentOS/RHEL: sudo yum install kernel-devel\n" +
+				"After installation, run: sudo modprobe tun")
+		}
+	}
 
 	// Инициализируем базу данных
 	db, err := gorm.Open(sqlite.Open(*dbPath), &gorm.Config{})
