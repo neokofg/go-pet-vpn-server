@@ -67,22 +67,72 @@ type Client struct {
 
 func (c *Client) WriteTUN(tun *TUNDevice, packet []byte) error {
 	// Проверяем, что это IPv4 пакет и он достаточного размера
-	if len(packet) < 20 || packet[0]>>4 != 4 {
-		return errors.New("invalid IP packet")
+	if len(packet) < 20 {
+		return fmt.Errorf("packet too small: %d bytes", len(packet))
+	}
+
+	version := packet[0] >> 4
+	if version != 4 {
+		return fmt.Errorf("invalid IP version: %d", version)
+	}
+
+	// Проверяем длину пакета
+	totalLength := int(binary.BigEndian.Uint16(packet[2:4]))
+	if totalLength > len(packet) {
+		return fmt.Errorf("declared length %d greater than packet size %d", totalLength, len(packet))
 	}
 
 	// Проверяем, что IP назначения соответствует нашей VPN сети
 	dstIP := net.IP(packet[16:20])
 	if !tun.config.Network.Contains(dstIP) {
-		return fmt.Errorf("destination IP %s not in VPN network", dstIP)
+		return fmt.Errorf("destination IP %s not in VPN network %s", dstIP, tun.config.Network)
 	}
 
 	// Записываем пакет в TUN интерфейс
-	if _, err := tun.Write(packet); err != nil {
+	n, err := tun.Write(packet)
+	if err != nil {
 		return fmt.Errorf("error writing to TUN: %v", err)
 	}
 
+	if n != len(packet) {
+		return fmt.Errorf("short write to TUN: wrote %d bytes, expected %d", n, len(packet))
+	}
+
 	return nil
+}
+
+func dumpPacket(data []byte) {
+	if len(data) < 20 {
+		log.Printf("Packet too small to dump: %d bytes", len(data))
+		return
+	}
+
+	version := data[0] >> 4
+	ihl := data[0] & 0x0F
+	tos := data[1]
+	totalLength := binary.BigEndian.Uint16(data[2:4])
+	id := binary.BigEndian.Uint16(data[4:6])
+	flags := data[6] >> 5
+	fragOffset := binary.BigEndian.Uint16(data[6:8]) & 0x1FFF
+	ttl := data[8]
+	protocol := data[9]
+	checksum := binary.BigEndian.Uint16(data[10:12])
+	srcIP := net.IP(data[12:16])
+	dstIP := net.IP(data[16:20])
+
+	log.Printf("IP Packet Dump:")
+	log.Printf("  Version: %d", version)
+	log.Printf("  IHL: %d", ihl)
+	log.Printf("  ToS: %d", tos)
+	log.Printf("  Total Length: %d", totalLength)
+	log.Printf("  ID: %d", id)
+	log.Printf("  Flags: %d", flags)
+	log.Printf("  Fragment Offset: %d", fragOffset)
+	log.Printf("  TTL: %d", ttl)
+	log.Printf("  Protocol: %d", protocol)
+	log.Printf("  Checksum: 0x%04x", checksum)
+	log.Printf("  Source IP: %s", srcIP)
+	log.Printf("  Destination IP: %s", dstIP)
 }
 
 type Server struct {
@@ -183,11 +233,16 @@ func (s *Server) Start(tunCfg *TunnelConfig) error {
 		return fmt.Errorf("insufficient privileges: %v", err)
 	}
 
-	if err := s.checkNetworkConfig(); err != nil {
-		return fmt.Errorf("network configuration check failed: %v", err)
+	log.Printf("Starting VPN server with config: %+v", tunCfg)
+
+	// Парсим CIDR для Network конфигурации
+	_, ipNet, err := net.ParseCIDR(tunCfg.CIDR)
+	if err != nil {
+		return fmt.Errorf("invalid CIDR: %v", err)
 	}
 
-	log.Printf("Starting VPN server with config: %+v", tunCfg)
+	// Сохраняем сетевую конфигурацию
+	s.cfg.Network = ipNet
 
 	// Очищаем старую конфигурацию
 	if err := cleanupOldConfig(tunCfg.Interface, tunCfg.CIDR); err != nil {
@@ -204,16 +259,12 @@ func (s *Server) Start(tunCfg *TunnelConfig) error {
 	}
 	s.ipPool = ipPool
 
-	// Настраиваем TUN интерфейс
+	// Создаем и настраиваем TUN интерфейс
 	tunDevice, err := s.setupTunnel(tunCfg)
 	if err != nil {
 		return fmt.Errorf("failed to setup TUN interface: %v", err)
 	}
 	s.tunInterface = tunDevice
-
-	if s.tunInterface == nil {
-		return fmt.Errorf("TUN interface was not properly initialized")
-	}
 
 	// Даем системе время на применение настроек
 	time.Sleep(time.Second)
@@ -224,31 +275,10 @@ func (s *Server) Start(tunCfg *TunnelConfig) error {
 		return fmt.Errorf("failed to setup routing: %v", err)
 	}
 
-	errChan := make(chan error, 4)
-
 	// Запускаем все обработчики
-	go func() {
-		if err := s.handleTCPConnections(); err != nil {
-			errChan <- fmt.Errorf("TCP handler error: %v", err)
-		}
-	}()
-
-	go func() {
-		if err := s.handleUDPPackets(); err != nil {
-			errChan <- fmt.Errorf("UDP handler error: %v", err)
-		}
-	}()
-
-	if s.tunInterface == nil {
-		return fmt.Errorf("TUN interface is nil before starting handlers")
-	}
-
-	go func() {
-		if err := s.handleTunToUDP(); err != nil {
-			errChan <- fmt.Errorf("TUN-to-UDP handler error: %v", err)
-		}
-	}()
-
+	go s.handleTCPConnections()
+	go s.handleUDPPackets()
+	go s.handleTunToUDP(tunDevice)
 	go s.cleanupInactiveClients()
 
 	log.Printf("Server started successfully. TCP: %s, UDP: %s, TUN: %s, Network: %s",
@@ -257,12 +287,8 @@ func (s *Server) Start(tunCfg *TunnelConfig) error {
 	// Проверяем состояние системы
 	go s.monitorSystemState(tunCfg)
 
-	select {
-	case err := <-errChan:
-		return err
-	case <-s.ctx.Done():
-		return nil
-	}
+	<-s.ctx.Done()
+	return nil
 }
 
 func (s *Server) checkNetworkConfig() error {
@@ -381,34 +407,16 @@ func (s *Server) handleTCPConnections() error {
 }
 
 func (s *Server) handleTCPClient(conn net.Conn) {
-	defer func() {
-		if err := conn.Close(); err != nil {
-			log.Printf("Error closing TCP connection: %v", err)
-		}
-	}()
-
-	// Проверяем количество активных клиентов
-	s.clientsMutex.RLock()
-	if len(s.clients) >= MaxConcurrentClients {
-		s.clientsMutex.RUnlock()
-		log.Printf("Max clients limit reached, rejecting connection")
-		return
-	}
-	s.clientsMutex.RUnlock()
+	defer conn.Close()
 
 	// Устанавливаем таймаут для хендшейка
 	conn.SetDeadline(time.Now().Add(protocol.HandshakeTimeout * time.Second))
 
-	// Ограничиваем размер буфера
-	buf := make([]byte, protocol.HeaderSize+120)
+	// Читаем handshake пакет
+	buf := make([]byte, protocol.HeaderSize+120) // Размер заголовка + размер handshake пакета
 	n, err := conn.Read(buf)
 	if err != nil {
 		log.Printf("Error reading handshake: %v", err)
-		return
-	}
-
-	if n > len(buf) {
-		log.Printf("Handshake packet too large")
 		return
 	}
 
@@ -456,6 +464,23 @@ func (s *Server) handleTCPClient(conn net.Conn) {
 		return
 	}
 
+	// Создаем контекст для клиента
+	ctx, cancel := context.WithCancel(s.ctx)
+
+	// Назначаем IP адрес клиенту
+	assignedIP, err := s.ipPool.Allocate()
+	if err != nil {
+		log.Printf("Failed to allocate IP: %v", err)
+		cancel()
+		return
+	}
+
+	if assignedIP[len(assignedIP)-1] == 0 {
+		assignedIP[len(assignedIP)-1] = 2 // Используем .2 как первый клиентский адрес
+	}
+
+	log.Printf("Allocating IP %s to client %s", assignedIP.String(), token.Token)
+
 	// Создаем клиента
 	client := &Client{
 		ID:          token.UserID,
@@ -466,11 +491,10 @@ func (s *Server) handleTCPClient(conn net.Conn) {
 		ServerNonce: serverNonce,
 		AEAD:        aead,
 		LastSeen:    time.Now(),
+		Ctx:         ctx,
+		Cancel:      cancel,
+		AssignedIP:  assignedIP,
 	}
-
-	ctx, cancel := context.WithCancel(s.ctx)
-	client.Ctx = ctx
-	client.Cancel = cancel
 
 	// Добавляем клиента в map
 	s.clientsMutex.Lock()
@@ -483,6 +507,18 @@ func (s *Server) handleTCPClient(conn net.Conn) {
 		Key:         [32]byte(key),
 	}
 
+	// Копируем IP адрес в ответ
+	copy(response.AssignedIP[:], assignedIP.To4())
+
+	// Устанавливаем маску подсети
+	if s.cfg.Network != nil {
+		copy(response.SubnetMask[:], s.cfg.Network.Mask)
+	} else {
+		// Используем маску по умолчанию /24 если сеть не настроена
+		mask := net.CIDRMask(24, 32)
+		copy(response.SubnetMask[:], mask)
+	}
+
 	responseData := response.Marshal()
 	responseHeader := &protocol.PacketHeader{
 		Version:     protocol.ProtocolVersion,
@@ -493,60 +529,67 @@ func (s *Server) handleTCPClient(conn net.Conn) {
 
 	// Отправляем ответ
 	headerData := responseHeader.Marshal()
-	_, err = conn.Write(append(headerData, responseData...))
-	if err != nil {
+	if _, err := conn.Write(append(headerData, responseData...)); err != nil {
 		log.Printf("Error sending handshake response: %v", err)
+		cancel()
+		s.clientsMutex.Lock()
+		delete(s.clients, token.Token)
+		s.clientsMutex.Unlock()
+		s.ipPool.Release(assignedIP)
 		return
 	}
 
 	// Снимаем таймаут после успешного хендшейка
 	conn.SetDeadline(time.Time{})
 
-	log.Printf("Client connected: %s", token.Token)
+	log.Printf("Client connected: %s with IP: %s", token.Token, assignedIP)
 }
 
-func (s *Server) handleUDPPackets() error {
+func (s *Server) handleUDPPackets() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in handleUDPPackets: %v", r)
+		}
+	}()
+
 	buf := make([]byte, protocol.MaxPacketSize)
 	for {
-		s.udpConn.SetReadDeadline(time.Now().Add(ReadTimeout))
-		n, addr, err := s.udpConn.ReadFromUDP(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+			n, addr, err := s.udpConn.ReadFromUDP(buf)
+			if err != nil {
+				if s.ctx.Err() != nil {
+					return
+				}
+				log.Printf("Error reading UDP packet: %v", err)
 				continue
 			}
-			if s.ctx.Err() != nil {
-				return err
-			}
-			log.Printf("Error reading UDP packet: %v", err)
-			continue
+
+			go s.handleUDPPacket(buf[:n], addr) // Убрали проверку ошибки, так как обработка идет в горутине
 		}
-
-		if n > MaxPacketSize {
-			log.Printf("Packet too large from %s: %d bytes", addr.String(), n)
-			continue
-		}
-
-		s.stats.Lock()
-		s.stats.PacketsReceived++
-		s.stats.BytesReceived += int64(n)
-		s.stats.Unlock()
-
-		go s.handleUDPPacket(buf[:n], addr)
 	}
 }
 
 func (s *Server) handleUDPPacket(data []byte, addr *net.UDPAddr) {
+	log.Printf("Handling UDP packet from %v, size: %d bytes", addr, len(data))
+	
 	if len(data) < protocol.HeaderSize {
+		log.Printf("Packet too small from %s: %d bytes", addr.String(), len(data))
 		return
 	}
 
 	header, err := protocol.UnmarshalHeader(data[:protocol.HeaderSize])
 	if err != nil {
-		log.Printf("Error parsing UDP header: %v", err)
+		log.Printf("Error parsing UDP header from %s: %v", addr.String(), err)
 		return
 	}
 
-	// Ищем клиента по sequence number и адресу
+	log.Printf("Received packet type %d from %s, sequence: %d, size: %d",
+		header.Type, addr.String(), header.SequenceNum, len(data))
+
+	// Находим клиента
 	s.clientsMutex.RLock()
 	var targetClient *Client
 	for _, client := range s.clients {
@@ -557,6 +600,27 @@ func (s *Server) handleUDPPacket(data []byte, addr *net.UDPAddr) {
 	}
 	s.clientsMutex.RUnlock()
 
+	// Если клиент не найден, проверяем новое подключение
+	if targetClient == nil {
+		s.clientsMutex.RLock()
+		for _, client := range s.clients {
+			if client.UDPAddr == nil {
+				targetClient = client
+				break
+			}
+		}
+		s.clientsMutex.RUnlock()
+
+		if targetClient != nil {
+			targetClient.Lock()
+			if targetClient.UDPAddr == nil {
+				targetClient.UDPAddr = addr
+				log.Printf("Associated UDP address %s with client %s", addr.String(), targetClient.Token)
+			}
+			targetClient.Unlock()
+		}
+	}
+
 	if targetClient == nil {
 		log.Printf("Unknown client from %s", addr.String())
 		return
@@ -565,36 +629,82 @@ func (s *Server) handleUDPPacket(data []byte, addr *net.UDPAddr) {
 	targetClient.Lock()
 	defer targetClient.Unlock()
 
-	// Обновляем время последнего пакета
 	targetClient.LastSeen = time.Now()
 
 	switch header.Type {
 	case protocol.PacketTypeData:
-		// Расшифровываем данные
+		if uint32(len(data)) < protocol.HeaderSize+header.PayloadSize {
+			log.Printf("Data packet too small from %s: expected %d, got %d",
+				addr.String(), protocol.HeaderSize+header.PayloadSize, len(data))
+			return
+		}
+
+		encryptedData := data[protocol.HeaderSize:]
+
+		// Создаем nonce из ClientNonce и SequenceNum
 		nonce := make([]byte, chacha20poly1305.NonceSize)
 		copy(nonce, targetClient.ClientNonce[:])
 		binary.BigEndian.PutUint64(nonce[len(nonce)-8:], header.SequenceNum)
 
-		payload, err := targetClient.AEAD.Open(nil, nonce, data[protocol.HeaderSize:], nil)
+		log.Printf("Decrypting packet: size=%d, nonce=%x", len(encryptedData), nonce)
+
+		// Расшифровываем данные
+		decrypted, err := targetClient.AEAD.Open(nil, nonce, encryptedData, nil)
 		if err != nil {
-			log.Printf("Error decrypting payload: %v", err)
+			log.Printf("Error decrypting data from %s: %v", addr.String(), err)
 			return
 		}
 
-		if err := targetClient.WriteTUN(s.tunInterface, payload); err != nil {
+		// Проверяем IP пакет
+		if len(decrypted) < 20 {
+			log.Printf("Decrypted packet too small: %d bytes", len(decrypted))
+			return
+		}
+
+		version := decrypted[0] >> 4
+		if version != 4 {
+			log.Printf("Invalid IP version: %d", version)
+			return
+		}
+
+		// Отладочная информация
+		srcIP := net.IP(decrypted[12:16])
+		dstIP := net.IP(decrypted[16:20])
+		totalLen := binary.BigEndian.Uint16(decrypted[2:4])
+
+		log.Printf("Decrypted packet: version=%d, src=%s, dst=%s, total_len=%d",
+			version, srcIP, dstIP, totalLen)
+
+		// Записываем в TUN
+		if _, err := s.tunInterface.Write(decrypted); err != nil {
 			log.Printf("Error writing to TUN: %v", err)
 			return
 		}
 
 	case protocol.PacketTypeKeepalive:
-		// Просто обновляем LastSeen
+		log.Printf("Received keepalive from %s", addr.String())
+
+		// Отправляем keepalive в ответ
+		responseHeader := &protocol.PacketHeader{
+			Version:     protocol.ProtocolVersion,
+			Type:        protocol.PacketTypeKeepalive,
+			SequenceNum: targetClient.SequenceNum,
+		}
+		targetClient.SequenceNum++
+
+		if _, err := s.udpConn.WriteToUDP(responseHeader.Marshal(), addr); err != nil {
+			log.Printf("Error sending keepalive response: %v", err)
+		}
 
 	case protocol.PacketTypeDisconnect:
+		log.Printf("Client disconnected: %s", targetClient.Token)
 		targetClient.Cancel()
 		s.clientsMutex.Lock()
 		delete(s.clients, targetClient.Token)
 		s.clientsMutex.Unlock()
-		log.Printf("Client disconnected: %s", targetClient.Token)
+
+	default:
+		log.Printf("Unknown packet type %d from %s", header.Type, addr.String())
 	}
 }
 
@@ -842,61 +952,61 @@ func (s *Server) setupTunnel(cfg *TunnelConfig) (*TUNDevice, error) {
 		return nil, fmt.Errorf("failed to create TUN interface: %v", err)
 	}
 
+	// Резервируем первый адрес для сервера
+	s.ipPool.Reserve(serverIP)
+
 	return tun, nil
 }
 
-func (s *Server) handleTunToUDP() error {
-	if s.tunInterface == nil {
-		return fmt.Errorf("TUN interface is nil")
-	}
-
+func (s *Server) handleTunToUDP(tun *TUNDevice) {
 	defer func() {
-		if s.tunInterface != nil {
-			s.tunInterface.Close()
+		if r := recover(); r != nil {
+			log.Printf("Recovered from panic in handleTunToUDP: %v", r)
 		}
 	}()
 
 	for {
-		if s.ctx.Err() != nil {
-			return nil // Сервер остановлен
-		}
-
-		// Читаем пакет из TUN
-		packet, err := s.tunInterface.ReadPacket()
-		if err != nil {
-			if s.ctx.Err() != nil {
-				return nil // Сервер остановлен
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+			// Читаем пакет из TUN
+			packet, err := tun.ReadPacket()
+			if err != nil {
+				if s.ctx.Err() != nil {
+					return
+				}
+				log.Printf("Error reading from TUN: %v", err)
+				continue
 			}
-			log.Printf("Error reading from TUN: %v", err)
-			continue
-		}
 
-		// Проверяем, что это IPv4 пакет
-		if len(packet) < 20 || packet[0]>>4 != 4 {
-			continue
-		}
-
-		// Получаем IP адрес назначения
-		dstIP := net.IP(packet[16:20])
-
-		// Находим клиента по IP
-		s.clientsMutex.RLock()
-		var targetClient *Client
-		for _, client := range s.clients {
-			if client.AssignedIP != nil && client.AssignedIP.Equal(dstIP) {
-				targetClient = client
-				break
+			// Проверяем, что это IPv4 пакет
+			if len(packet) < 20 || packet[0]>>4 != 4 {
+				continue
 			}
-		}
-		s.clientsMutex.RUnlock()
 
-		if targetClient == nil {
-			continue // Неизвестный получатель
-		}
+			// Получаем IP адрес назначения
+			dstIP := net.IP(packet[16:20])
 
-		// Отправляем пакет клиенту
-		if err := s.sendPacketToClient(targetClient, packet); err != nil {
-			log.Printf("Error sending packet to client %s: %v", targetClient.AssignedIP, err)
+			// Находим клиента по IP
+			s.clientsMutex.RLock()
+			var targetClient *Client
+			for _, client := range s.clients {
+				if client.AssignedIP != nil && client.AssignedIP.Equal(dstIP) {
+					targetClient = client
+					break
+				}
+			}
+			s.clientsMutex.RUnlock()
+
+			if targetClient == nil {
+				continue // Неизвестный получатель
+			}
+
+			// Передаем пакет клиенту
+			if err := s.sendPacketToClient(targetClient, packet); err != nil {
+				log.Printf("Error sending packet to client %s: %v", targetClient.AssignedIP, err)
+			}
 		}
 	}
 }
@@ -905,8 +1015,8 @@ func (s *Server) sendPacketToClient(client *Client, packet []byte) error {
 	client.Lock()
 	defer client.Unlock()
 
-	if client.UDPAddr == nil || client.AEAD == nil {
-		return fmt.Errorf("client not ready for UDP communication")
+	if client.UDPAddr == nil {
+		return fmt.Errorf("client UDP address not set")
 	}
 
 	// Создаем nonce для шифрования

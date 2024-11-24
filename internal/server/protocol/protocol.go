@@ -93,11 +93,10 @@ func UnmarshalHandshake(data []byte) (*HandshakePacket, error) {
 
 type HandshakeResponse struct {
 	ServerNonce [24]byte // Нонс сервера
+	Key         [32]byte // Ключ шифрования
 	AssignedIP  [4]byte  // Назначенный IP-адрес
 	SubnetMask  [4]byte  // Маска подсети
 	MTU         uint16   // MTU для туннеля
-	Reserved    uint16   // Зарезервировано для будущего использования
-	Key         [32]byte
 }
 
 func (hr *HandshakeResponse) Marshal() []byte {
