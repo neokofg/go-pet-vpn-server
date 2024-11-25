@@ -84,7 +84,7 @@ func (c *Client) WriteTUN(tun *TUNDevice, packet []byte) error {
 
 	// Проверяем, что IP назначения соответствует нашей VPN сети
 	dstIP := net.IP(packet[16:20])
-	if !tun.config.Network.Contains(dstIP) {
+	if !tun.config.Network.Contains(dstIP) && !isBroadcast(dstIP, tun.config.Network) {
 		return fmt.Errorf("destination IP %s not in VPN network %s", dstIP, tun.config.Network)
 	}
 
@@ -98,7 +98,29 @@ func (c *Client) WriteTUN(tun *TUNDevice, packet []byte) error {
 		return fmt.Errorf("short write to TUN: wrote %d bytes, expected %d", n, len(packet))
 	}
 
+	log.Printf("Successfully wrote packet to TUN: dst=%s, size=%d", dstIP, n)
 	return nil
+}
+
+// isBroadcast checks if the IP is a broadcast address for the given network
+func isBroadcast(ip net.IP, network *net.IPNet) bool {
+	if ip == nil || network == nil {
+		return false
+	}
+	
+	// Get the IP in 4-byte format
+	ip = ip.To4()
+	if ip == nil {
+		return false
+	}
+	
+	// Calculate broadcast address for the network
+	broadcast := make(net.IP, 4)
+	for i := range broadcast {
+		broadcast[i] = network.IP[i] | ^network.Mask[i]
+	}
+	
+	return ip.Equal(broadcast)
 }
 
 func dumpPacket(data []byte) {
@@ -200,14 +222,16 @@ func NewServer(cfg *config.Config, db *gorm.DB) (*Server, error) {
 	}
 
 	// Создаем UDP connection
-	udpAddr, err := net.ResolveUDPAddr("udp", cfg.UDPAddr)
+	// Явно указываем IPv4
+	udpAddr, err := net.ResolveUDPAddr("udp4", cfg.UDPAddr)
 	if err != nil {
 		tcpListener.Close()
 		cancel()
 		return nil, err
 	}
 
-	udpConn, err := net.ListenUDP("udp", udpAddr)
+	log.Printf("Creating UDP listener on address: %v", udpAddr)
+	udpConn, err := net.ListenUDP("udp4", udpAddr)
 	if err != nil {
 		tcpListener.Close()
 		cancel()
@@ -222,6 +246,7 @@ func NewServer(cfg *config.Config, db *gorm.DB) (*Server, error) {
 		clients:     make(map[string]*Client),
 		ctx:         ctx,
 		cancel:      cancel,
+		stats:       &ServerStats{},
 	}
 
 	return s, nil
@@ -552,6 +577,7 @@ func (s *Server) handleUDPPackets() {
 		}
 	}()
 
+	log.Printf("Starting UDP packet handler on %v", s.udpConn.LocalAddr())
 	buf := make([]byte, protocol.MaxPacketSize)
 	for {
 		select {
@@ -567,144 +593,112 @@ func (s *Server) handleUDPPackets() {
 				continue
 			}
 
+			log.Printf("Received UDP packet: from=%v size=%d", addr, n)
 			go s.handleUDPPacket(buf[:n], addr) // Убрали проверку ошибки, так как обработка идет в горутине
 		}
 	}
 }
 
-func (s *Server) handleUDPPacket(data []byte, addr *net.UDPAddr) {
-	log.Printf("Handling UDP packet from %v, size: %d bytes", addr, len(data))
-	
-	if len(data) < protocol.HeaderSize {
-		log.Printf("Packet too small from %s: %d bytes", addr.String(), len(data))
-		return
+func (s *Server) handleUDPPacket(packet []byte, addr *net.UDPAddr) error {
+	if len(packet) < protocol.HeaderSize {
+		return fmt.Errorf("received packet too small: %d bytes", len(packet))
 	}
 
-	header, err := protocol.UnmarshalHeader(data[:protocol.HeaderSize])
+	log.Printf("Received UDP packet from %v, size: %d bytes", addr, len(packet))
+
+	// Parse packet header
+	header, err := protocol.UnmarshalHeader(packet[:protocol.HeaderSize])
 	if err != nil {
-		log.Printf("Error parsing UDP header from %s: %v", addr.String(), err)
-		return
+		return fmt.Errorf("failed to unmarshal packet header: %v", err)
 	}
 
-	log.Printf("Received packet type %d from %s, sequence: %d, size: %d",
-		header.Type, addr.String(), header.SequenceNum, len(data))
+	log.Printf("Packet header: version=%d, type=%d, sequence=%d, payload_size=%d",
+		header.Version, header.Type, header.SequenceNum, header.PayloadSize)
 
-	// Находим клиента
+	// Check protocol version
+	if header.Version != protocol.ProtocolVersion {
+		return fmt.Errorf("unsupported protocol version: %d", header.Version)
+	}
+
+	// Find the client by UDP address
 	s.clientsMutex.RLock()
-	var targetClient *Client
-	for _, client := range s.clients {
-		if client.UDPAddr != nil && client.UDPAddr.String() == addr.String() {
-			targetClient = client
+	var client *Client
+	for _, c := range s.clients {
+		if c.UDPAddr != nil && c.UDPAddr.String() == addr.String() {
+			client = c
 			break
 		}
 	}
 	s.clientsMutex.RUnlock()
 
-	// Если клиент не найден, проверяем новое подключение
-	if targetClient == nil {
+	// If client not found by UDP address, try to find by decrypting the packet
+	if client == nil && header.Type == protocol.PacketTypeData {
 		s.clientsMutex.RLock()
-		for _, client := range s.clients {
-			if client.UDPAddr == nil {
-				targetClient = client
+		for _, c := range s.clients {
+			log.Printf("Trying to decrypt with client %s", c.Token)
+			nonce := make([]byte, chacha20poly1305.NonceSize)
+			copy(nonce, c.ClientNonce[:])
+			binary.BigEndian.PutUint64(nonce[len(nonce)-8:], header.SequenceNum)
+
+			decrypted, decryptErr := c.AEAD.Open(nil, nonce, packet[protocol.HeaderSize:], nil)
+			if decryptErr == nil && len(decrypted) >= 20 {
+				client = c
+				c.UDPAddr = addr
+				log.Printf("Associated UDP address %s with client %s", addr.String(), c.Token)
 				break
 			}
+			log.Printf("Failed to decrypt with client %s: %v", c.Token, decryptErr)
 		}
 		s.clientsMutex.RUnlock()
-
-		if targetClient != nil {
-			targetClient.Lock()
-			if targetClient.UDPAddr == nil {
-				targetClient.UDPAddr = addr
-				log.Printf("Associated UDP address %s with client %s", addr.String(), targetClient.Token)
-			}
-			targetClient.Unlock()
-		}
 	}
 
-	if targetClient == nil {
-		log.Printf("Unknown client from %s", addr.String())
-		return
+	if client == nil {
+		return fmt.Errorf("no client found for address: %v", addr)
 	}
-
-	targetClient.Lock()
-	defer targetClient.Unlock()
-
-	targetClient.LastSeen = time.Now()
 
 	switch header.Type {
 	case protocol.PacketTypeData:
-		if uint32(len(data)) < protocol.HeaderSize+header.PayloadSize {
-			log.Printf("Data packet too small from %s: expected %d, got %d",
-				addr.String(), protocol.HeaderSize+header.PayloadSize, len(data))
-			return
-		}
+		encryptedData := packet[protocol.HeaderSize:]
+		log.Printf("Attempting to decrypt data packet: encrypted_size=%d, from_client=%v", 
+			len(encryptedData), addr)
 
-		encryptedData := data[protocol.HeaderSize:]
-
-		// Создаем nonce из ClientNonce и SequenceNum
+		// Create nonce for decryption
 		nonce := make([]byte, chacha20poly1305.NonceSize)
-		copy(nonce, targetClient.ClientNonce[:])
+		copy(nonce, client.ClientNonce[:])
 		binary.BigEndian.PutUint64(nonce[len(nonce)-8:], header.SequenceNum)
 
-		log.Printf("Decrypting packet: size=%d, nonce=%x", len(encryptedData), nonce)
-
-		// Расшифровываем данные
-		decrypted, err := targetClient.AEAD.Open(nil, nonce, encryptedData, nil)
+		// Decrypt the data
+		decrypted, err := client.AEAD.Open(nil, nonce, encryptedData, nil)
 		if err != nil {
-			log.Printf("Error decrypting data from %s: %v", addr.String(), err)
-			return
+			return fmt.Errorf("failed to decrypt packet from %v: %v", addr, err)
 		}
 
-		// Проверяем IP пакет
-		if len(decrypted) < 20 {
-			log.Printf("Decrypted packet too small: %d bytes", len(decrypted))
-			return
-		}
+		log.Printf("Successfully decrypted packet: size=%d bytes, from_client=%v", 
+			len(decrypted), addr)
 
-		version := decrypted[0] >> 4
-		if version != 4 {
-			log.Printf("Invalid IP version: %d", version)
-			return
-		}
-
-		// Отладочная информация
-		srcIP := net.IP(decrypted[12:16])
-		dstIP := net.IP(decrypted[16:20])
-		totalLen := binary.BigEndian.Uint16(decrypted[2:4])
-
-		log.Printf("Decrypted packet: version=%d, src=%s, dst=%s, total_len=%d",
-			version, srcIP, dstIP, totalLen)
-
-		// Записываем в TUN
+		// Write decrypted data to TUN
 		if _, err := s.tunInterface.Write(decrypted); err != nil {
-			log.Printf("Error writing to TUN: %v", err)
-			return
+			return fmt.Errorf("failed to write to TUN: %v", err)
 		}
+
+		log.Printf("Successfully wrote decrypted packet to TUN interface")
+		return nil
 
 	case protocol.PacketTypeKeepalive:
 		log.Printf("Received keepalive from %s", addr.String())
-
-		// Отправляем keepalive в ответ
-		responseHeader := &protocol.PacketHeader{
-			Version:     protocol.ProtocolVersion,
-			Type:        protocol.PacketTypeKeepalive,
-			SequenceNum: targetClient.SequenceNum,
-		}
-		targetClient.SequenceNum++
-
-		if _, err := s.udpConn.WriteToUDP(responseHeader.Marshal(), addr); err != nil {
-			log.Printf("Error sending keepalive response: %v", err)
-		}
+		return nil
 
 	case protocol.PacketTypeDisconnect:
-		log.Printf("Client disconnected: %s", targetClient.Token)
-		targetClient.Cancel()
+		log.Printf("Received disconnect from %s", addr.String())
 		s.clientsMutex.Lock()
-		delete(s.clients, targetClient.Token)
+		delete(s.clients, client.Token)
 		s.clientsMutex.Unlock()
+		s.ReleaseIP(client)
+		client.Cancel()
+		return nil
 
 	default:
-		log.Printf("Unknown packet type %d from %s", header.Type, addr.String())
+		return fmt.Errorf("unknown packet type: %d", header.Type)
 	}
 }
 
@@ -757,13 +751,13 @@ type Route struct {
 func NewTUN(config *TUNConfig) (*TUNDevice, error) {
 	log.Printf("Creating TUN interface %s...", config.Name)
 
-	// Создаем конфигурацию для water
+	// Create water config
 	cfg := water.Config{
 		DeviceType: water.TUN,
 		PlatformSpecificParams: water.PlatformSpecificParams{
 			Name:       config.Name,
-			Persist:    true, // Делаем интерфейс постоянным
-			MultiQueue: true, // Поднимаем интерфейс сразу
+			Persist:    true, // Make the interface persistent
+			MultiQueue: true, // Bring up the interface immediately
 		},
 	}
 
@@ -778,7 +772,7 @@ func NewTUN(config *TUNConfig) (*TUNDevice, error) {
 		config:    config,
 	}
 
-	// Ждем немного перед настройкой
+	// Wait a bit before configuring
 	time.Sleep(time.Second)
 
 	log.Printf("Configuring TUN interface %s...", tun.name)
@@ -787,7 +781,7 @@ func NewTUN(config *TUNConfig) (*TUNDevice, error) {
 		return nil, err
 	}
 
-	// Проверяем состояние интерфейса после настройки
+	// Check the interface state after configuration
 	iface, err := net.InterfaceByName(tun.name)
 	if err != nil {
 		tun.Close()
@@ -810,60 +804,97 @@ func (t *TUNDevice) configure() error {
 }
 
 func (t *TUNDevice) configureLinux() error {
-	// Ждем немного перед настройкой
+	// Wait a bit before configuring
 	time.Sleep(time.Second)
 
-	// Отключаем IPv6
+	// Disable IPv6
 	if err := exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6=1", t.name)).Run(); err != nil {
 		log.Printf("Warning: failed to disable IPv6: %v", err)
 	}
 
-	// Поднимаем интерфейс и устанавливаем MTU
+	// Bring up the interface and set MTU
 	cmd := exec.Command("ip", "link", "set", "dev", t.name, "up", "mtu", fmt.Sprintf("%d", t.config.MTU))
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to set interface up: %v, output: %s", err, output)
 	}
 
-	// Ждем после поднятия интерфейса
-	time.Sleep(time.Second)
-
-	// Проверяем состояние
-	iface, err := net.InterfaceByName(t.name)
-	if err != nil {
-		return fmt.Errorf("failed to get interface after up: %v", err)
+	// Wait and check the interface state
+	maxAttempts := 5
+	for i := 0; i < maxAttempts; i++ {
+		time.Sleep(time.Second)
+		
+		iface, err := net.InterfaceByName(t.name)
+		if err != nil {
+			log.Printf("Warning: attempt %d/%d - failed to get interface: %v", i+1, maxAttempts, err)
+			continue
+		}
+		
+		if iface.Flags&net.FlagUp != 0 {
+			log.Printf("Interface %s is up after %d seconds", t.name, i+1)
+			break
+		}
+		
+		if i == maxAttempts-1 {
+			return fmt.Errorf("interface failed to come up after %d attempts", maxAttempts)
+		}
 	}
-	log.Printf("Interface %s state after up: %v", t.name, iface.Flags)
 
-	// Назначаем IP адрес
+	// Set IP address
 	addr := fmt.Sprintf("%s/%d", t.config.Address.String(), maskBits(t.config.Network.Mask))
 	cmd = exec.Command("ip", "addr", "add", addr, "dev", t.name)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		// Если адрес уже существует, пробуем его заменить
+		// If the address already exists, try to replace it
 		cmd = exec.Command("ip", "addr", "replace", addr, "dev", t.name)
 		if output, err = cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("failed to set address: %v, output: %s", err, output)
 		}
 	}
 
-	// Ждем после настройки адреса
-	time.Sleep(time.Second)
+	// Check IP address assignment
+	maxAttempts = 5
+	for i := 0; i < maxAttempts; i++ {
+		time.Sleep(time.Second)
+		
+		iface, err := net.InterfaceByName(t.name)
+		if err != nil {
+			log.Printf("Warning: attempt %d/%d - failed to get interface: %v", i+1, maxAttempts, err)
+			continue
+		}
+		
+		addrs, err := iface.Addrs()
+		if err != nil {
+			log.Printf("Warning: attempt %d/%d - failed to get addresses: %v", i+1, maxAttempts, err)
+			continue
+		}
+		
+		for _, a := range addrs {
+			if strings.Contains(a.String(), t.config.Address.String()) {
+				log.Printf("Address %s configured successfully on %s", addr, t.name)
+				return nil
+			}
+		}
+		
+		if i == maxAttempts-1 {
+			return fmt.Errorf("failed to verify IP address configuration after %d attempts", maxAttempts)
+		}
+	}
 
 	return nil
 }
 
 func (t *TUNDevice) configureDarwin() error {
-	// Поднимаем интерфейс и устанавливаем IP
+	// Bring up the interface and set IP
 	addr := fmt.Sprintf("%s/%d", t.config.Address.String(), maskBits(t.config.Network.Mask))
 	if err := exec.Command("ifconfig", t.name, addr, "up").Run(); err != nil {
 		return fmt.Errorf("failed to configure interface: %v", err)
 	}
 
-	// Устанавливаем MTU
+	// Set MTU
 	if err := exec.Command("ifconfig", t.name, "mtu", fmt.Sprintf("%d", t.config.MTU)).Run(); err != nil {
 		return fmt.Errorf("failed to set MTU: %v", err)
 	}
 
-	// Добавляем маршруты
+	// Add routes
 	for _, route := range t.config.Routes {
 		args := []string{"-n", "add", "-net", route.Network.String()}
 		if route.Gateway != nil {
@@ -900,7 +931,7 @@ func (t *TUNDevice) WritePacket(packet []byte) error {
 }
 
 func (t *TUNDevice) Close() error {
-	// Удаляем маршруты
+	// Remove routes
 	if runtime.GOOS == "linux" {
 		for _, route := range t.config.Routes {
 			exec.Command("ip", "route", "del", route.Network.String(), "dev", t.name).Run()
@@ -921,18 +952,18 @@ type TunnelConfig struct {
 }
 
 func (s *Server) setupTunnel(cfg *TunnelConfig) (*TUNDevice, error) {
-	// Парсим CIDR
+	// Parse CIDR
 	_, network, err := net.ParseCIDR(cfg.CIDR)
 	if err != nil {
 		return nil, fmt.Errorf("invalid CIDR: %v", err)
 	}
 
-	// Генерируем IP адрес для сервера (первый адрес в сети)
+	// Generate server IP address (first address in the network)
 	serverIP := make(net.IP, len(network.IP))
 	copy(serverIP, network.IP)
 	serverIP[len(serverIP)-1] |= 1
 
-	// Конфигурация TUN интерфейса
+	// TUN interface configuration
 	tunConfig := &TUNConfig{
 		Name:    cfg.Interface,
 		MTU:     cfg.MTU,
@@ -941,18 +972,18 @@ func (s *Server) setupTunnel(cfg *TunnelConfig) (*TUNDevice, error) {
 		Routes: []Route{
 			{
 				Network: network,
-				Gateway: nil, // Маршрутизация через интерфейс
+				Gateway: nil, // Route through the interface
 			},
 		},
 	}
 
-	// Создаем TUN интерфейс
+	// Create TUN interface
 	tun, err := NewTUN(tunConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TUN interface: %v", err)
 	}
 
-	// Резервируем первый адрес для сервера
+	// Reserve the first address for the server
 	s.ipPool.Reserve(serverIP)
 
 	return tun, nil
@@ -965,13 +996,13 @@ func (s *Server) handleTunToUDP(tun *TUNDevice) {
 		}
 	}()
 
+	buffer := make([]byte, MaxPacketSize)
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		default:
-			// Читаем пакет из TUN
-			packet, err := tun.ReadPacket()
+			n, err := tun.Read(buffer)
 			if err != nil {
 				if s.ctx.Err() != nil {
 					return
@@ -980,15 +1011,50 @@ func (s *Server) handleTunToUDP(tun *TUNDevice) {
 				continue
 			}
 
-			// Проверяем, что это IPv4 пакет
-			if len(packet) < 20 || packet[0]>>4 != 4 {
+			packet := buffer[:n]
+			
+			// Check if it's an Ethernet frame
+			var ipPacket []byte
+			if len(packet) >= 14 {
+				etherType := binary.BigEndian.Uint16(packet[12:14])
+				if etherType == 0x0800 { // IPv4
+					ipPacket = packet[14:]
+				} else if etherType == 0x0806 { // ARP
+					log.Printf("Received ARP packet, handling...")
+					if err := s.handleARPPacket(packet[14:]); err != nil {
+						log.Printf("Error handling ARP packet: %v", err)
+					}
+					continue
+				} else {
+					log.Printf("Unknown EtherType: 0x%04x", etherType)
+					continue
+				}
+			} else {
+				ipPacket = packet
+			}
+
+			// Check if it's an IPv4 packet
+			if len(ipPacket) < 20 {
+				log.Printf("Packet too short for IPv4: %d bytes", len(ipPacket))
 				continue
 			}
 
-			// Получаем IP адрес назначения
-			dstIP := net.IP(packet[16:20])
+			version := ipPacket[0] >> 4
+			if version != 4 {
+				log.Printf("Not an IPv4 packet: version=%d", version)
+				continue
+			}
 
-			// Находим клиента по IP
+			// Get destination IP address
+			dstIP := net.IP(ipPacket[16:20])
+			srcIP := net.IP(ipPacket[12:16])
+			protocol := ipPacket[9]
+			length := binary.BigEndian.Uint16(ipPacket[2:4])
+			
+			log.Printf("Processing packet: Protocol=%d, Src=%s, Dst=%s, Length=%d",
+				protocol, srcIP, dstIP, length)
+
+			// Find the client by IP
 			s.clientsMutex.RLock()
 			var targetClient *Client
 			for _, client := range s.clients {
@@ -1000,15 +1066,62 @@ func (s *Server) handleTunToUDP(tun *TUNDevice) {
 			s.clientsMutex.RUnlock()
 
 			if targetClient == nil {
-				continue // Неизвестный получатель
+				log.Printf("No client found for IP %s", dstIP)
+				continue
 			}
 
-			// Передаем пакет клиенту
-			if err := s.sendPacketToClient(targetClient, packet); err != nil {
+			// Send only the IP packet to the client
+			if err := s.sendPacketToClient(targetClient, ipPacket); err != nil {
 				log.Printf("Error sending packet to client %s: %v", targetClient.AssignedIP, err)
+			} else {
+				log.Printf("Successfully sent packet to client %s", targetClient.AssignedIP)
 			}
 		}
 	}
+}
+
+func (s *Server) handleARPPacket(packet []byte) error {
+	if len(packet) < 28 {
+		return fmt.Errorf("ARP packet too short: %d bytes", len(packet))
+	}
+
+	// Analyze ARP packet
+	protocolType := binary.BigEndian.Uint16(packet[2:4])
+	operation := binary.BigEndian.Uint16(packet[6:8])
+
+	// Get IP addresses
+	senderIP := net.IP(packet[14:18])
+	targetIP := net.IP(packet[24:28])
+
+	log.Printf("ARP: op=%d, sender=%s, target=%s", operation, senderIP, targetIP)
+
+	// Check if it's an IPv4 ARP
+	if protocolType != 0x0800 {
+		return fmt.Errorf("unsupported protocol type in ARP: 0x%04x", protocolType)
+	}
+
+	// If it's an ARP request to the server or another client in the VPN network
+	if operation == 1 { // ARP Request
+		// Create an ARP response
+		reply := make([]byte, 28)
+		copy(reply, packet) // Copy the header
+
+		// Change the operation type to response
+		binary.BigEndian.PutUint16(reply[6:8], 2) // ARP Reply
+
+		// Swap the MAC and IP addresses
+		copy(reply[8:14], packet[18:24])  // Target MAC -> Sender MAC
+		copy(reply[14:18], targetIP)      // Target IP -> Sender IP
+		copy(reply[18:24], packet[8:14])  // Sender MAC -> Target MAC
+		copy(reply[24:28], senderIP)      // Sender IP -> Target IP
+
+		// Send the response through TUN
+		if _, err := s.tunInterface.Write(reply); err != nil {
+			return fmt.Errorf("failed to send ARP reply: %v", err)
+		}
+	}
+
+	return nil
 }
 
 func (s *Server) sendPacketToClient(client *Client, packet []byte) error {
@@ -1019,15 +1132,15 @@ func (s *Server) sendPacketToClient(client *Client, packet []byte) error {
 		return fmt.Errorf("client UDP address not set")
 	}
 
-	// Создаем nonce для шифрования
+	// Create nonce for encryption
 	nonce := make([]byte, chacha20poly1305.NonceSize)
 	copy(nonce, client.ServerNonce[:])
 	binary.BigEndian.PutUint64(nonce[len(nonce)-8:], client.SequenceNum)
 
-	// Шифруем пакет
+	// Encrypt the packet
 	encrypted := client.AEAD.Seal(nil, nonce, packet, nil)
 
-	// Создаем заголовок
+	// Create header
 	header := &protocol.PacketHeader{
 		Version:     protocol.ProtocolVersion,
 		Type:        protocol.PacketTypeData,
@@ -1035,30 +1148,30 @@ func (s *Server) sendPacketToClient(client *Client, packet []byte) error {
 		PayloadSize: uint32(len(encrypted)),
 	}
 
-	// Увеличиваем sequence number
+	// Increment sequence number
 	client.SequenceNum++
 
-	// Формируем полный пакет
+	// Form the full packet
 	fullPacket := append(header.Marshal(), encrypted...)
 
-	// Отправляем пакет
+	// Send the packet
 	_, err := s.udpConn.WriteToUDP(fullPacket, client.UDPAddr)
 	return err
 }
 
 func (s *Server) handleEncryptedPacket(client *Client, header *protocol.PacketHeader, encryptedData []byte) error {
-	// Создаем nonce из ClientNonce и SequenceNum
+	// Create nonce from ClientNonce and SequenceNum
 	nonce := make([]byte, chacha20poly1305.NonceSize)
 	copy(nonce, client.ClientNonce[:])
 	binary.BigEndian.PutUint64(nonce[len(nonce)-8:], header.SequenceNum)
 
-	// Расшифровываем данные
+	// Decrypt the data
 	decrypted, err := client.AEAD.Open(nil, nonce, encryptedData, nil)
 	if err != nil {
 		return err
 	}
 
-	// Пишем расшифрованный пакет в TUN интерфейс
+	// Write decrypted packet to TUN interface
 	_, err = s.tunInterface.Write(decrypted)
 	return err
 }
@@ -1091,18 +1204,18 @@ func (p *IPPool) Allocate() (net.IP, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Начинаем с первого доступного адреса в сети
+	// Start with the first available address in the network
 	ip := make(net.IP, len(p.network.IP))
 	copy(ip, p.network.IP)
 
-	// Перебираем адреса, пока не найдем свободный
+	// Iterate through addresses until we find a free one
 	for {
 		if !p.used[ip.String()] {
 			p.used[ip.String()] = true
 			return ip, nil
 		}
 
-		// Увеличиваем IP на 1
+		// Increment IP by 1
 		for i := len(ip) - 1; i >= 0; i-- {
 			ip[i]++
 			if ip[i] != 0 {
@@ -1110,7 +1223,7 @@ func (p *IPPool) Allocate() (net.IP, error) {
 			}
 		}
 
-		// Проверяем, что адрес все еще в нашей сети
+		// Check if the address is still in our network
 		if !p.network.Contains(ip) {
 			return nil, errors.New("ip pool exhausted")
 		}
@@ -1133,153 +1246,108 @@ func (s *Server) setupRouting(cfg *TunnelConfig) error {
 }
 
 func (s *Server) setupLinuxRouting(cfg *TunnelConfig) error {
-	log.Printf("Setting up routing for %s...", cfg.Interface)
+	// Enable IP forwarding
+	if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
+		return fmt.Errorf("failed to enable IP forwarding: %v", err)
+	}
 
-	// Получаем имя основного сетевого интерфейса
+	// Get the default interface
 	defaultIface, err := getDefaultInterface()
 	if err != nil {
-		log.Printf("Warning: failed to get default interface automatically: %v", err)
-		// Пытаемся получить имя интерфейса из окружения
-		defaultIface = os.Getenv("VPN_DEFAULT_IFACE")
-		if defaultIface == "" {
-			// Проверяем наличие конкретных интерфейсов
-			for _, iface := range []string{"eth0", "en0", "ens33", "enp0s3"} {
-				if _, err := net.InterfaceByName(iface); err == nil {
-					defaultIface = iface
-					break
-				}
+		return fmt.Errorf("failed to get default interface: %v", err)
+	}
+
+	log.Printf("Using default interface: %s", defaultIface)
+
+	// First, try to remove old rules (ignore errors)
+	cleanupCommands := [][]string{
+		{"iptables", "-t", "nat", "-D", "POSTROUTING", "-s", cfg.CIDR, "-j", "MASQUERADE"},
+		{"iptables", "-D", "FORWARD", "-i", cfg.Interface, "-j", "ACCEPT"},
+		{"iptables", "-D", "FORWARD", "-o", cfg.Interface, "-j", "ACCEPT"},
+		{"iptables", "-D", "INPUT", "-i", cfg.Interface, "-j", "ACCEPT"},
+		{"iptables", "-D", "OUTPUT", "-o", cfg.Interface, "-j", "ACCEPT"},
+	}
+
+	for _, cmd := range cleanupCommands {
+		_ = exec.Command(cmd[0], cmd[1:]...).Run()
+	}
+
+	// Add new rules
+	setupCommands := [][]string{
+		// Allow NAT for the VPN network
+		{"iptables", "-t", "nat", "-A", "POSTROUTING", "-s", cfg.CIDR, "-o", defaultIface, "-j", "MASQUERADE"},
+		// Allow forwarding
+		{"iptables", "-A", "FORWARD", "-i", cfg.Interface, "-j", "ACCEPT"},
+		{"iptables", "-A", "FORWARD", "-o", cfg.Interface, "-j", "ACCEPT"},
+		// Allow incoming and outgoing traffic for the VPN
+		{"iptables", "-A", "INPUT", "-i", cfg.Interface, "-j", "ACCEPT"},
+		{"iptables", "-A", "OUTPUT", "-o", cfg.Interface, "-j", "ACCEPT"},
+	}
+
+	// Apply new rules
+	for _, cmd := range setupCommands {
+		if output, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to setup iptables rule '%v': %v (output: %s)", cmd, err, string(output))
+		}
+	}
+
+	// Configure routing for the VPN network
+	log.Printf("Adding route for VPN network %s via interface %s", cfg.CIDR, cfg.Interface)
+	
+	// Check if the interface exists and is up
+	maxAttempts := 5
+	for i := 0; i < maxAttempts; i++ {
+		ifaceCmd := exec.Command("ip", "link", "show", cfg.Interface)
+		if output, err := ifaceCmd.CombinedOutput(); err != nil {
+			if i == maxAttempts-1 {
+				return fmt.Errorf("interface %s is not ready after %d attempts: %v (output: %s)", 
+					cfg.Interface, maxAttempts, err, string(output))
 			}
-			if defaultIface == "" {
-				return fmt.Errorf("no network interface found and VPN_DEFAULT_IFACE not set")
+			log.Printf("Warning: attempt %d/%d - interface not ready: %v", i+1, maxAttempts, err)
+			time.Sleep(time.Second)
+			continue
+		}
+		break
+	}
+	
+	// First, try to delete the existing route
+	delRouteCmd := exec.Command("ip", "route", "del", cfg.CIDR)
+	_ = delRouteCmd.Run() // Ignore errors when deleting
+
+	// Now add the new route
+	for i := 0; i < maxAttempts; i++ {
+		addRouteCmd := exec.Command("ip", "route", "add", cfg.CIDR, "dev", cfg.Interface)
+		if output, err := addRouteCmd.CombinedOutput(); err != nil {
+			if i == maxAttempts-1 {
+				return fmt.Errorf("failed to add route after %d attempts: %v (output: %s)", 
+					maxAttempts, err, string(output))
 			}
+			log.Printf("Warning: attempt %d/%d - failed to add route: %v", i+1, maxAttempts, err)
+			time.Sleep(time.Second)
+			continue
 		}
+		log.Printf("Route added successfully for %s via %s", cfg.CIDR, cfg.Interface)
+		break
 	}
 
-	log.Printf("Using network interface: %s", defaultIface)
-
-	// Включаем IP forwarding
-	if err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run(); err != nil {
-		log.Printf("Warning: failed to enable IP forwarding: %v", err)
-	}
-
-	// Настраиваем NAT
-	natRule := []string{"-t", "nat", "-A", "POSTROUTING", "-s", cfg.CIDR, "-o", defaultIface, "-j", "MASQUERADE"}
-	cmd := exec.Command("iptables", natRule...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("Warning: failed to setup NAT, trying alternative method: %v, output: %s", err, output)
-		// Пробуем альтернативный метод NAT
-		natRule = []string{"-t", "nat", "-A", "POSTROUTING", "-s", cfg.CIDR, "-j", "MASQUERADE"}
-		cmd = exec.Command("iptables", natRule...)
-		if output, err = cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to setup NAT: %v, output: %s", err, output)
-		}
-	}
-
-	// Разрешаем форвардинг
-	forwardRules := [][]string{
-		{"-A", "FORWARD", "-i", cfg.Interface, "-j", "ACCEPT"},
-		{"-A", "FORWARD", "-o", cfg.Interface, "-j", "ACCEPT"},
-	}
-
-	for _, rule := range forwardRules {
-		cmd = exec.Command("iptables", rule...)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to add forward rule: %v, output: %s", err, output)
-			// Продолжаем выполнение, так как некоторые правила могут уже существовать
-		}
-	}
-
-	// Добавляем маршрут
-	cmd = exec.Command("ip", "route", "add", cfg.CIDR, "dev", cfg.Interface)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("Warning: failed to add route, trying replacement: %v, output: %s", err, output)
-		// Пробуем заменить существующий маршрут
-		cmd = exec.Command("ip", "route", "replace", cfg.CIDR, "dev", cfg.Interface)
-		if output, err = cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to setup route: %v, output: %s", err, output)
-		}
-	}
-
+	log.Printf("Routing and NAT configured successfully")
 	return nil
 }
 
-func getDefaultInterface() (string, error) {
-	// Пробуем несколько способов найти интерфейс по умолчанию
-
-	// Способ 1: через ip route
-	cmd := exec.Command("ip", "route", "show", "default")
-	output, err := cmd.CombinedOutput()
-	if err == nil {
-		fields := strings.Fields(string(output))
-		for i, field := range fields {
-			if field == "dev" && i+1 < len(fields) {
-				return fields[i+1], nil
-			}
-		}
-	}
-
-	// Способ 2: проверяем популярные интерфейсы
-	commonInterfaces := []string{"eth0", "en0", "ens33", "enp0s3", "wlan0", "wlp2s0"}
-	for _, ifname := range commonInterfaces {
-		iface, err := net.InterfaceByName(ifname)
-		if err != nil {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		// Проверяем, есть ли у интерфейса IP адрес
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
-				return ifname, nil
-			}
-		}
-	}
-
-	// Способ 3: перебираем все интерфейсы
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return "", fmt.Errorf("failed to list interfaces: %v", err)
-	}
-
-	for _, iface := range interfaces {
-		// Пропускаем loopback и интерфейсы без флага up
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
-				return iface.Name, nil
-			}
-		}
-	}
-
-	return "", errors.New("no suitable network interface found")
-}
-
 func (s *Server) setupDarwinRouting(cfg *TunnelConfig) error {
-	// Включаем IP forwarding
+	// Enable IP forwarding
 	if err := exec.Command("sysctl", "-w", "net.inet.ip.forwarding=1").Run(); err != nil {
 		return fmt.Errorf("failed to enable IP forwarding: %v", err)
 	}
 
-	// Настраиваем NAT с помощью pfctl
+	// Configure NAT using pfctl
 	pf := fmt.Sprintf(`
 nat on en0 from %s to any -> (en0)
 pass in on %s all
 pass out on %s all
     `, cfg.CIDR, cfg.Interface, cfg.Interface)
 
-	// Записываем правила в временный файл
+	// Write rules to a temporary file
 	tmpfile, err := os.CreateTemp("", "pf.conf")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %v", err)
@@ -1290,12 +1358,12 @@ pass out on %s all
 		return fmt.Errorf("failed to write pf rules: %v", err)
 	}
 
-	// Загружаем правила
+	// Load rules
 	if err := exec.Command("pfctl", "-f", tmpfile.Name()).Run(); err != nil {
 		return fmt.Errorf("failed to load pf rules: %v", err)
 	}
 
-	// Включаем PF
+	// Enable PF
 	if err := exec.Command("pfctl", "-e").Run(); err != nil {
 		return fmt.Errorf("failed to enable pf: %v", err)
 	}
@@ -1313,10 +1381,10 @@ func (s *Server) cleanupRouting(cfg *TunnelConfig) error {
 }
 
 func (s *Server) cleanupLinuxRouting(cfg *TunnelConfig) error {
-	// Удаляем правила NAT
+	// Remove NAT rules
 	exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", cfg.CIDR, "-j", "MASQUERADE").Run()
 
-	// Удаляем правила форвардинга
+	// Remove forwarding rules
 	exec.Command("iptables", "-D", "FORWARD", "-i", cfg.Interface, "-j", "ACCEPT").Run()
 	exec.Command("iptables", "-D", "FORWARD", "-o", cfg.Interface, "-j", "ACCEPT").Run()
 
@@ -1324,43 +1392,43 @@ func (s *Server) cleanupLinuxRouting(cfg *TunnelConfig) error {
 }
 
 func (s *Server) cleanupDarwinRouting(cfg *TunnelConfig) error {
-	// Отключаем PF
+	// Disable PF
 	exec.Command("pfctl", "-d").Run()
 
 	return nil
 }
 
-// cleanupOldConfig очищает старые настройки VPN
+// cleanupOldConfig cleans up old VPN configuration
 func cleanupOldConfig(interfaceName string, cidr string) error {
 	log.Printf("Cleaning up old VPN configuration...")
 
-	// Останавливаем systemd-networkd
+	// Stop systemd-networkd
 	if err := exec.Command("systemctl", "stop", "systemd-networkd").Run(); err != nil {
 		log.Printf("Warning: failed to stop systemd-networkd: %v", err)
 	}
 
-	// Удаляем старый интерфейс
+	// Remove old interface
 	cleanupInterface(interfaceName)
 
-	// Ждем немного после удаления интерфейса
+	// Wait a bit after removing the interface
 	time.Sleep(time.Second * 2)
 
-	// Очищаем правила iptables
+	// Clean up iptables rules
 	cleanupIPTables(interfaceName, cidr)
 
-	// Очищаем маршруты
+	// Clean up routes
 	cleanupRoutes(interfaceName, cidr)
 
 	return nil
 }
 
-// cleanupIPTables очищает правила iptables
+// cleanupIPTables cleans up iptables rules
 func cleanupIPTables(interfaceName string, cidr string) {
-	// Получаем основной интерфейс
+	// Get the default interface
 	defaultIface, err := getDefaultInterface()
 	if err != nil {
 		log.Printf("Warning: couldn't get default interface: %v", err)
-		defaultIface = "*" // Используем wildcard если не можем получить интерфейс
+		defaultIface = "*" // Use wildcard if we can't get the interface
 	}
 
 	rules := [][]string{
@@ -1370,33 +1438,33 @@ func cleanupIPTables(interfaceName string, cidr string) {
 	}
 
 	for _, rule := range rules {
-		// Пытаемся удалить правило несколько раз, так как их может быть несколько
+		// Try to remove the rule several times, as there may be multiple
 		for i := 0; i < 5; i++ {
 			cmd := exec.Command(rule[0], rule[1:]...)
 			if _, err := cmd.CombinedOutput(); err != nil {
-				break // Правило больше не существует
+				break // Rule no longer exists
 			}
 			log.Printf("Removed iptables rule: %v", rule)
 		}
 	}
 }
 
-// cleanupRoutes очищает маршруты
+// cleanupRoutes cleans up routes
 func cleanupRoutes(interfaceName string, cidr string) {
-	// Удаляем все маршруты для интерфейса
+	// Remove all routes for the interface
 	cmd := exec.Command("ip", "route", "flush", "dev", interfaceName)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("Warning: couldn't flush routes: %v, output: %s", err, string(output))
 	}
 
-	// Дополнительно пытаемся удалить конкретный маршрут
+	// Additionally, try to remove the specific route
 	cmd = exec.Command("ip", "route", "del", cidr, "dev", interfaceName)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("Warning: couldn't delete specific route: %v, output: %s", err, string(output))
 	}
 }
 
-// cleanupInterface удаляет старый интерфейс
+// cleanupInterface removes the old interface
 func cleanupInterface(interfaceName string) {
 	cmd := exec.Command("ip", "link", "delete", interfaceName)
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -1405,4 +1473,67 @@ func cleanupInterface(interfaceName string) {
 	} else {
 		log.Printf("Removed interface: %s", interfaceName)
 	}
+}
+
+func getDefaultInterface() (string, error) {
+	// Try several ways to find the default interface
+
+	// Method 1: through ip route
+	cmd := exec.Command("ip", "route", "show", "default")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		fields := strings.Fields(string(output))
+		for i, field := range fields {
+			if field == "dev" && i+1 < len(fields) {
+				return fields[i+1], nil
+			}
+		}
+	}
+
+	// Method 2: check popular interfaces
+	commonInterfaces := []string{"eth0", "en0", "ens33", "enp0s3", "wlan0", "wlp2s0"}
+	for _, ifname := range commonInterfaces {
+		iface, err := net.InterfaceByName(ifname)
+		if err != nil {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		// Check if the interface has an IP address
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+				return ifname, nil
+			}
+		}
+	}
+
+	// Method 3: iterate through all interfaces
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("failed to list interfaces: %v", err)
+	}
+
+	for _, iface := range interfaces {
+		// Skip loopback and interfaces without the up flag
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+				return iface.Name, nil
+			}
+		}
+	}
+
+	return "", errors.New("no suitable network interface found")
 }
